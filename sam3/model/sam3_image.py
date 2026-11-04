@@ -18,6 +18,7 @@ from .act_ckpt_utils import activation_ckpt_wrapper
 from .box_ops import box_cxcywh_to_xyxy
 from .data_misc import FindStage
 from .geometry_encoders import Prompt
+from .maskformer_segmentation import DeferredMasks
 from .model_misc import inverse_sigmoid
 
 
@@ -408,17 +409,24 @@ class Sam3Image(torch.nn.Module):
                 act_ckpt_enable=self.training and self.use_act_checkpoint_seg_head,
                 prompt=prompt,
                 prompt_mask=prompt_mask,
+                # Training only: masks of the matched queries are computed in
+                # the loss (DeferredMasks) instead of all queries here.
+                defer_instance_masks=self.training
+                and getattr(self, "masks_for_matched_queries_only", False),
             )
             aux_masks = False  # self.aux_loss and self.segmentation_head.aux_masks
             for k, v in seg_head_outputs.items():
                 if k in self.segmentation_head.instance_keys:
-                    _update_out(out, k, v[:, :num_o2o], auxiliary=aux_masks)
+                    if isinstance(v, DeferredMasks):
+                        v_o2o = v.slice_queries(None, num_o2o)
+                        v_o2m = v.slice_queries(num_o2o, None)
+                    else:
+                        v_o2o, v_o2m = v[:, :num_o2o], v[:, num_o2o:]
+                    _update_out(out, k, v_o2o, auxiliary=aux_masks)
                     if (
                         self.o2m_mask_predict and num_o2m > 0
                     ):  # handle o2m mask prediction
-                        _update_out(
-                            out, f"{k}_o2m", v[:, num_o2o:], auxiliary=aux_masks
-                        )
+                        _update_out(out, f"{k}_o2m", v_o2m, auxiliary=aux_masks)
                 else:
                     out[k] = v
         else:

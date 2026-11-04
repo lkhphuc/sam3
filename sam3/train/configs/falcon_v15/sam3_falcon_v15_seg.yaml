@@ -48,6 +48,10 @@ trainer:
   seed: 123
   amp_dtype: bfloat16
   batch_matching_over_layers: true
+  # Compute instance mask logits only for the matched (o2o + o2m) queries, in
+  # the loss, instead of 288x288 masks for all 400 queries of every prompt.
+  # Same loss; off until checked on GPU (docs/FALCON_V15_TRAINING.md).
+  masks_for_matched_queries_only: false
   norm_mean: [0.5, 0.5, 0.5]
   norm_std: [0.5, 0.5, 0.5]
   # Parameters that never receive a gradient in this setup (measured by

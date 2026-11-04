@@ -160,9 +160,31 @@ Run these before a long run, roughly in this order. None of them could run in th
 10. **LR sweep.** Sweep `scratch.lr_scale` ∈ {0.5, 1, 2} on one node for about 5k steps. The released configs finetune at 0.1. Here the detector starts from scratch, so the right scale is unknown.
 11. **Evaluation.** Run the SA-Co/Gold configs (`configs/gold_image_evals/`) and a held-out Falcon slice on saved checkpoints as a separate job. The eval configs build the model with `build_sam3_image_model`, so point them at a trunk/text config that matches this run (24 blocks, context 256).
 
+## Masks for matched queries only (flag, off by default)
+
+`trainer.masks_for_matched_queries_only: true`.
+
+- **Default path.** The seg head computes `pred_masks` [prompts, 400, 288, 288] for every object query (200 o2o + 200 o2m): about 66 MB bf16 per prompt, plus its gradient. The loss only ever uses the matched rows.
+- **With the flag** (training only):
+  - The seg head returns a `DeferredMasks` (`model/maskformer_segmentation.py`): the mask-embedded queries plus the per-prompt pixel embeddings.
+  - `Masks` computes logits only for the matched (prompt, query) pairs, o2o and o2m, with one matmul per prompt that has matches.
+  - Memory then scales with the number of matched instances, not with queries × 400.
+  - Eval and inference are unchanged (dense masks).
+
+**Tests** (`test/test_matched_masks.py`, CPU):
+- `gather` equals rows of the dense masks, values and gradients.
+- The `Masks` loss is equal for the nearest, bilinear and full-res variants.
+- On the real tiny model with the real loss config, every loss term is equal, and gradients in the seg head and decoder match to about 1e-6 relative (fp32 rounding).
+
+**GPU checks:**
+1. A few steps with the flag on and off: identical loss curves under bf16 (close, not bitwise).
+2. Peak memory at a fixed `max_queries_per_batch`.
+3. Then re-run the budget sweep (check 7) with the flag on to find the new maximum queries per GPU.
+4. The per-prompt grouping costs one device→host sync per `Masks` call (o2o and o2m). Check in the profiler that it doesn't stall the stream.
+
 ## Not done yet (planned efficiency work)
 
-- **Masks for matched queries only.** The seg head computes 288² masks for all 400 queries (o2o + o2m) of every prompt. Computing them only for matched queries, or only at the sampled points, is the main lever for more queries per GPU. It is a model change; do it after check 7 gives a baseline.
+- **Masks at the sampled points only.** With `masks_for_matched_queries_only` (below), each matched query still gets a full 288² logit map before point sampling. Sampling the pixel embeddings at the points instead would cut that further.
 - **o2m matcher.** It still runs once per layer in the loss.
 - **Selective activation checkpointing and `torch.compile` of the trunk.** Use `compile_vision: true`, and measure.
 - **Tokenization in the loader workers.**

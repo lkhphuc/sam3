@@ -13,6 +13,8 @@ COCO-JSON finetunes):
   * bf16 autocast without GradScaler (fp16 keeps the scaler);
   * the next batch is copied to the GPU on a side stream while the current
     step runs (pinned memory, see Sam3FalconBatch.pin_memory);
+  * optionally (masks_for_matched_queries_only) instance masks are computed
+    only for the matched queries, in the loss, not for all queries;
   * parameters can be frozen by pattern (e.g. tensors that never get a
     gradient), so DDP can run with find_unused_parameters=False.
 """
@@ -155,6 +157,7 @@ class StreamingTrainer:
         amp_dtype: str = "bfloat16",
         frozen_param_patterns: Optional[List[str]] = None,
         batch_matching_over_layers: bool = True,
+        masks_for_matched_queries_only: bool = False,
         norm_mean: List[float] = (0.5, 0.5, 0.5),
         norm_std: List[float] = (0.5, 0.5, 0.5),
         profiler: Optional[Dict[str, Any]] = None,
@@ -183,6 +186,10 @@ class StreamingTrainer:
         self._freeze(frozen_param_patterns or [])
         if batch_matching_over_layers:
             _unwrap(self.model).batch_matching_over_layers = True
+        if masks_for_matched_queries_only:
+            # The seg head returns DeferredMasks; Masks computes only the
+            # matched (o2o and o2m) queries' mask logits.
+            _unwrap(self.model).masks_for_matched_queries_only = True
         self.model.to(self.device)
         self.loss = instantiate(loss, _convert_="all").to(self.device)
         self.optim = construct_optimizer(

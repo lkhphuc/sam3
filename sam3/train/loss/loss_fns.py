@@ -17,6 +17,8 @@ from sam3.train.loss.sigmoid_focal_loss import (
 )
 from torch import nn
 
+from sam3.model.maskformer_segmentation import DeferredMasks
+
 from .mask_sampling import (
     calculate_uncertainty,
     get_uncertain_point_coords_with_randomness,
@@ -574,6 +576,14 @@ class Boxes(LossWithWeights):
         return losses
 
 
+def _select_matched_masks(pred_masks, batch_idx, query_idx):
+    """pred_masks[batch_idx, query_idx] for a dense [B, Q, H, W] tensor or a
+    DeferredMasks (which computes only those rows)."""
+    if isinstance(pred_masks, DeferredMasks):
+        return pred_masks.gather(batch_idx, query_idx)
+    return pred_masks[(batch_idx, query_idx)]
+
+
 class Masks(LossWithWeights):
     def __init__(
         self,
@@ -661,10 +671,12 @@ class Masks(LossWithWeights):
         if tgt_idx is None:
             tgt_idx = torch.arange(len(indices[0]), device=src_masks_all.device)
         keep = targets["is_valid_mask"][tgt_idx]
-        src_masks = src_masks_all[(indices[0], indices[1])][keep]
+        src_masks = _select_matched_masks(
+            src_masks_all, indices[0][keep], indices[1][keep]
+        )
         tgt_idx = tgt_idx[keep]
         if src_masks.shape[0] == 0:
-            zero = src_masks_all.sum() * 0.0
+            zero = src_masks.sum() * 0.0
             return {"loss_mask": zero, "loss_dice": zero.clone()}
         src_masks = src_masks[:, None].float()
         with torch.no_grad():
@@ -723,14 +735,14 @@ class Masks(LossWithWeights):
         target_masks = (
             targets["masks"] if indices[2] is None else targets["masks"][indices[2]]
         )
-        target_masks = target_masks.to(src_masks)
         keep = (
             targets["is_valid_mask"]
             if indices[2] is None
             else targets["is_valid_mask"][indices[2]]
         )
 
-        src_masks = src_masks[(indices[0], indices[1])]
+        src_masks = _select_matched_masks(src_masks, indices[0], indices[1])
+        target_masks = target_masks.to(src_masks)
 
         # Remove invalid masks from loss
         src_masks = src_masks[keep]
