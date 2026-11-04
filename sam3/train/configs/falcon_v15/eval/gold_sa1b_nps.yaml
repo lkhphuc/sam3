@@ -1,0 +1,6 @@
+# @package _global_
+# SA-Co/Gold "sa1b_nps" on a Falcon-v1.5-trained checkpoint (see falcon_model.yaml).
+defaults:
+  - /configs/gold_image_evals/sam3_gold_image_sa1b_nps
+  - /configs/falcon_v15/eval/falcon_model
+  - _self_

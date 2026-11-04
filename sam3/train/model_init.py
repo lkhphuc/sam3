@@ -330,3 +330,74 @@ def set_activation_checkpointing(
     if m.segmentation_head is not None:
         m.segmentation_head.act_ckpt = "seg_head" not in off
     m.geometry_encoder.use_act_ckpt = "geometry" not in off
+
+
+def build_sam3_image_model_for_eval(
+    *,
+    checkpoint_path: str,
+    vit_depth: int = 24,
+    vit_mlp_ratio: float = 4.0,
+    vit_global_att_blocks: Optional[Sequence[int]] = None,
+    text_context_length: int = 256,
+    bpe_path: Optional[str] = None,
+    enable_segmentation: bool = True,
+    compile_vision: bool = False,
+    device: str = "cuda",
+    eval_mode: bool = True,
+    **_ignored,
+):
+    """A StreamingTrainer checkpoint as an eval model (Hydra target).
+
+    Takes the same keyword names as sam3.model_builder.build_sam3_image_model
+    (bpe_path, device, eval_mode, enable_segmentation, checkpoint_path), so an
+    eval config can swap the `_target_` and add the trunk / text shape of the
+    run. Loads `checkpoint_path` (StreamingTrainer checkpoint.pt or
+    checkpoint_<step>.pt: its "model" entry, or a bare state dict) strictly.
+    """
+    if _ignored:
+        logger.info(f"build_sam3_image_model_for_eval ignores {sorted(_ignored)}")
+    if not checkpoint_path:
+        raise ValueError("checkpoint_path is required (a StreamingTrainer checkpoint)")
+    model = build_sam3_image_model_for_training(
+        bpe_path=bpe_path,
+        vit_depth=vit_depth,
+        vit_mlp_ratio=vit_mlp_ratio,
+        vit_global_att_blocks=vit_global_att_blocks,
+        vit_drop_path_rate=0.0,
+        text_context_length=text_context_length,
+        text_pad_to_longest=False,
+        enable_segmentation=enable_segmentation,
+        compile_vision=compile_vision,
+        pe_checkpoint=None,
+    )
+    from iopath.common.file_io import g_pathmgr
+
+    with g_pathmgr.open(checkpoint_path, "rb") as f:
+        state = torch.load(f, map_location="cpu", weights_only=False)
+    sd = state.get("model", state) if isinstance(state, dict) else state
+    # The RoPE tables are recomputed buffers whose shape follows the trunk's
+    # window layout; drop them so a layout mismatch reports as the keys below.
+    own = model.state_dict()
+    sd = {k: v for k, v in sd.items() if not k.endswith("freqs_cis")}
+    shape_mismatch = [k for k, v in sd.items() if k in own and own[k].shape != v.shape]
+    if shape_mismatch:
+        raise ValueError(
+            f"{checkpoint_path} does not match the eval model (vit_depth / vit_mlp_ratio / "
+            f"text_context_length of the run?): shape mismatch for {shape_mismatch[:10]}"
+        )
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    # RoPE tables are recomputed buffers; anything else missing is a shape /
+    # config mismatch with the run.
+    missing = [k for k in missing if not k.endswith("freqs_cis")]
+    if missing or unexpected:
+        raise ValueError(
+            f"{checkpoint_path} does not match the eval model (vit_depth / vit_mlp_ratio / "
+            f"text_context_length of the run?): missing {missing[:10]}, unexpected {unexpected[:10]}"
+        )
+    step = state.get("step") if isinstance(state, dict) else None
+    logger.info(f"Loaded {checkpoint_path} (step {step}) for eval")
+    if device == "cuda" and torch.cuda.is_available():
+        model = model.cuda()
+    if eval_mode:
+        model.eval()
+    return model

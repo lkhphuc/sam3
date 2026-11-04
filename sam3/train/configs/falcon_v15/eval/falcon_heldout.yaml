@@ -1,0 +1,60 @@
+# @package _global_
+# Held-out Falcon v1.5 segmentation pairs (scripts/falcon_v15/make_falcon_eval_set.py)
+# on a Falcon-v1.5-trained checkpoint. Same transforms and cgF1 evaluation as
+# the SA-Co/Gold image evals, with a single GT.
+#   FALCON_EVAL_DIR       output dir of make_falcon_eval_set.py (images/, gt.json)
+#   SAM3_EVAL_CHECKPOINT, SAM3_EVAL_OUT   as in falcon_model.yaml
+# Per level / language / source: scripts/falcon_v15/cgf1_by_slice.py on the dump.
+defaults:
+  - /configs/eval_base.yaml
+  - /configs/falcon_v15/eval/falcon_model
+  - _self_
+
+paths:
+  falcon_eval_dir: ${oc.env:FALCON_EVAL_DIR}
+  experiment_log_dir: ${paths.base_experiment_log_dir}/falcon_heldout/
+  coco_gt: ${paths.falcon_eval_dir}/gt.json
+
+trainer:
+  data:
+    val:
+      _target_: sam3.train.data.torch_dataset.TorchDataset
+      dataset:
+        _target_: sam3.train.data.sam3_image_dataset.Sam3ImageDataset
+        coco_json_loader:
+          _target_: sam3.train.data.coco_json_loaders.SAM3_EVAL_API_FROM_JSON_NP
+          _partial_: true
+        img_folder: ${paths.falcon_eval_dir}/images
+        ann_file: ${paths.coco_gt}
+        transforms: ${scratch.base_val_transform}
+        max_ann_per_img: 100000
+        multiplier: 1
+        training: false
+      shuffle: False
+      batch_size: ${scratch.val_batch_size}
+      num_workers: ${scratch.num_val_workers}
+      pin_memory: False
+      drop_last: False
+      collate_fn:
+        _target_: sam3.train.data.collator.collate_fn_api
+        _partial_: true
+        repeats: ${scratch.hybrid_repeats}
+        dict_key: falcon_heldout
+  meters:
+    val:
+      falcon_heldout:
+        cgf1:
+          _target_: sam3.eval.coco_writer.PredictionDumper
+          iou_type: "segm"
+          dump_dir: ${launcher.experiment_log_dir}/dumps/falcon_heldout
+          merge_predictions: True
+          postprocessor: ${scratch.mask_postprocessor_thresholded}
+          gather_pred_via_filesys: ${scratch.gather_pred_via_filesys}
+          maxdets: 1000000
+          pred_file_evaluators:
+            - _target_: sam3.eval.cgf1_eval.CGF1Evaluator
+              gt_path: ${paths.coco_gt}
+              iou_type: "bbox"
+            - _target_: sam3.eval.cgf1_eval.CGF1Evaluator
+              gt_path: ${paths.coco_gt}
+              iou_type: "segm"

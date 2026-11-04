@@ -68,13 +68,41 @@ def _metadata_ext(path: str) -> str:
         return "json"
 
 
+def _expand_braces(pattern: str):
+    """energon split patterns: 'shard_{000000..000009}.tar' (zero-padded ranges)."""
+    import re
+
+    m = re.search(r"\{(\d+)\.\.(\d+)\}", pattern)
+    if not m:
+        return [pattern]
+    a, b = m.group(1), m.group(2)
+    out = []
+    for i in range(int(a), int(b) + 1):
+        out += _expand_braces(
+            pattern[: m.start()] + str(i).zfill(len(a)) + pattern[m.end() :]
+        )
+    return out
+
+
+def split_tars(path: str, split: str):
+    """Tars of one split part ("train" / "val") of an energon dataset, from
+    .nv-meta/split.yaml; None when the dataset has no split.yaml."""
+    split_file = os.path.join(path, ".nv-meta", "split.yaml")
+    if not os.path.exists(split_file):
+        return None
+    with open(split_file) as f:
+        parts = (yaml.safe_load(f) or {}).get("split_parts", {})
+    return [
+        os.path.join(path, t)
+        for pat in parts.get(split) or []
+        for t in _expand_braces(pat)
+    ]
+
+
 def _tars(path: str):
-    info = os.path.join(path, ".nv-meta", ".info.yaml")
-    if os.path.exists(info):
-        with open(info) as f:
-            counts = (yaml.safe_load(f) or {}).get("shard_counts", {})
-        if counts:
-            return [os.path.join(path, t) for t in counts]
+    tars = split_tars(path, "train")
+    if tars is not None:
+        return tars
     return sorted(glob.glob(os.path.join(path, "**", "*.tar"), recursive=True))
 
 

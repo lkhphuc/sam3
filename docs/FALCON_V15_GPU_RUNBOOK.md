@@ -19,7 +19,7 @@ export RUNS=/mnt/falcon-perception/sam3_runs
 
 ```bash
 pytest -q test/test_falcon_schema.py test/test_falcon_energon.py test/test_falcon_energon_e2e.py \
-  test/test_model_init.py test/test_matched_masks.py
+  test/test_model_init.py test/test_matched_masks.py test/test_falcon_eval.py
 pytest -q test/test_streaming_trainer.py   # ~6 min, ~12 GB RAM
 ```
 
@@ -197,7 +197,45 @@ torchrun --nnodes $NNODES --nproc_per_node 8 --rdzv_backend c10d --rdzv_endpoint
 
 ## 11. Evaluation (separate job, on saved checkpoints)
 
-Not wired up yet. The eval configs (`configs/gold_image_evals/`, `configs/eval_base.yaml`) build the model with `sam3.model_builder.build_sam3_image_model`, which has SAM3's 32-block trunk and 32-token text. For these checkpoints the eval model must be `sam3.train.model_init.build_sam3_image_model_for_training` with the run's `vit_depth`, `vit_mlp_ratio` and `text_context_length`, `pe_checkpoint: null`, in eval mode, with the checkpoint's `model` state dict loaded. Plan it as its own change once a checkpoint exists.
+Eval runs through the released epoch trainer in `mode: val`, with overlay configs in `configs/falcon_v15/eval/`.
+- `falcon_model.yaml` swaps the model for `sam3.train.model_init.build_sam3_image_model_for_eval`, which has the run's trunk and text shape and loads `checkpoint.pt` strictly.
+- Paths come from environment variables.
+- If the run changed `vit_depth`, `vit_mlp_ratio` or `text_context_length`, set the same values in `falcon_model.yaml`. A mismatch fails loudly at load time.
+
+**SA-Co/Gold** (does the model still do open-vocabulary concept segmentation?). Needs the released SA-Co/Gold GT and images.
+
+```bash
+export SAM3_EVAL_CHECKPOINT=$RUNS/<run>/checkpoints/checkpoint_<step>.pt
+export SAM3_EVAL_OUT=$RUNS/<run>/eval_<step>
+export SAM3_GOLD_GT_DIR=<gold GT dir> SAM3_METACLIP_IMG_DIR=<metaclip images> SAM3_SA1B_IMG_DIR=<sa1b images>
+for s in metaclip_nps sa1b_nps crowded fg_food fg_sports attributes wiki_common; do
+  python sam3/train/train.py -c configs/falcon_v15/eval/gold_$s.yaml --use-cluster 0 --num-gpus 8
+done
+```
+
+Metrics are logged as `cgF1_eval_segm_*` / `cgF1_eval_bbox_*` in `$SAM3_EVAL_OUT/gold_*/logs/` (`val_stats.json`). Compare against the released SAM3 numbers on the same sets.
+
+**Held-out Falcon pairs** (in-domain, per level and language; the comparison with the AR model).
+
+1. Build the eval set once from the sources' `val` split tars (never the training tars):
+
+   ```bash
+   python scripts/falcon_v15/make_falcon_eval_set.py $BLEND --out /mnt/falcon-perception/sam3_eval/falcon_v15_heldout      --max-images-per-source 300
+   ```
+
+   It lists the sources without a val split. Prepare one with torchtitan-internal's `energon_prepare_perception.py --val-tar` **before training**, so the val tars are excluded from training through energon's split.
+
+2. Evaluate and slice:
+
+   ```bash
+   export FALCON_EVAL_DIR=/mnt/falcon-perception/sam3_eval/falcon_v15_heldout
+   python sam3/train/train.py -c configs/falcon_v15/eval/falcon_heldout.yaml --use-cluster 0 --num-gpus 8
+   python scripts/falcon_v15/cgf1_by_slice.py --gt $FALCON_EVAL_DIR/gt.json      --pred $SAM3_EVAL_OUT/falcon_heldout/dumps/falcon_heldout/coco_predictions_segm.json      --by level lang source --out $SAM3_EVAL_OUT/falcon_heldout/cgf1_by_slice.json
+   ```
+
+Each slice is the positive pairs of that level, language or source plus the negatives asked on the same images; cgF1 includes the image-level MCC, which needs both. Use the same GT file for the AR model's predictions so both are scored identically.
+
+**Good:** on the first checkpoints, cgF1 rises with training steps on both sets. A model trained only on Falcon data may score lower than the released SAM3 on SA-Co/Gold; report that as a result, not a bug.
 
 ## Results to send back
 
@@ -206,3 +244,4 @@ Not wired up yet. The eval configs (`configs/gold_image_evals/`, `configs/eval_b
 3. The step-3 and step-4 printouts.
 4. The `bench_*.jsonl` files, `top_ops_*.txt`, and the chosen budget.
 5. TensorBoard scalars or `train_stats.jsonl` from steps 8 and 9.
+6. `val_stats.json` per eval set and `cgf1_by_slice.json` (step 11).

@@ -28,6 +28,9 @@ The review and the reasoning behind the design are in
 | `sam3/train/configs/falcon_v15/sam3_falcon_v15_seg.yaml` | The run config. |
 | `sam3/train/configs/falcon_v15/datasets/sam3_falcon_v15_seg.yaml` | Segmentation blend: 42 of the 47 v1.5 sources, same repetitions. Regenerate with `scripts/falcon_v15/make_seg_blend.py`. |
 | `scripts/falcon_v15/check_pe_init.py` | GPU check that the PE features carry over (RoPE layout). |
+| `sam3/train/configs/falcon_v15/eval/` | Eval overlays: `gold_*.yaml` (SA-Co/Gold) and `falcon_heldout.yaml`, with `falcon_model.yaml` swapping in `build_sam3_image_model_for_eval`. |
+| `scripts/falcon_v15/make_falcon_eval_set.py`, `cgf1_by_slice.py` | Held-out Falcon pairs (val split tars) in SA-Co/Gold format; cgF1 per level, language and source. |
+| `scripts/falcon_v15/bench_train_step.py`, `scan_blend.py`, `inspect_loader.py` | GPU benchmark / numerics, annotation scan, loader inspection ([runbook](FALCON_V15_GPU_RUNBOOK.md)). |
 
 ### Changes to existing SAM3 code
 
@@ -100,7 +103,7 @@ All of these are needed for training. Inference outputs are unchanged.
 
 ```bash
 pytest test/test_falcon_schema.py test/test_falcon_energon.py test/test_falcon_energon_e2e.py \
-  test/test_model_init.py test/test_streaming_trainer.py
+  test/test_model_init.py test/test_matched_masks.py test/test_falcon_eval.py test/test_streaming_trainer.py
 ```
 
 **Schema** (`test_falcon_schema.py`):
@@ -169,7 +172,7 @@ Run these before a long run, roughly in this order. None of them could run in th
 8. **Data wait.** `Perf/data_wait_s_max` should stay near 0. If not, raise `num_workers` (watch host RAM) or move tokenization into the workers.
 9. **Preemption.** Send SIGTERM to one rank. All ranks save within `log_freq` steps and exit, and the relaunch resumes the loader position.
 10. **LR sweep.** Sweep `scratch.lr_scale` ∈ {0.5, 1, 2} on one node for about 5k steps. The released configs finetune at 0.1. Here the detector starts from scratch, so the right scale is unknown.
-11. **Evaluation.** Run the SA-Co/Gold configs (`configs/gold_image_evals/`) and a held-out Falcon slice on saved checkpoints as a separate job. The eval configs build the model with `build_sam3_image_model`, so point them at a trunk/text config that matches this run (24 blocks, context 256).
+11. **Evaluation.** Run SA-Co/Gold and the held-out Falcon pairs on saved checkpoints with the overlays in `configs/falcon_v15/eval/` (runbook step 11).
 
 ## Masks for matched queries only (flag, off by default)
 
