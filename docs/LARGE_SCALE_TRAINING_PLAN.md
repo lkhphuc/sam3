@@ -99,9 +99,13 @@ Semantics to map onto SAM3's `FindQuery`:
 | negative query | `negative_expressions` keys, with 0 targets |
 | `is_exhaustive` | `True` by default (each ref-seg key lists all of its instances); a per-source subflavor overrides it; forced `False` when instances are subsampled (below) |
 
-**Levels:** SAM3 is a *concept* model (short noun phrases plus attributes). Falcon levels 3–6 (spatial, interaction, logic, practical) are referring/reasoning expressions SAM3 isn't built for. Including them teaches it to return a single instance for a phrase whose noun has several. The default proposal is `level: [0, 1, 2, dense, none]`, with 3–6 as an ablation (§6, Q1).
+**Levels: all of them (decided).** The goal is to stress-test the SAM3 architecture against the autoregressive model on the same supervised data, so there is no level or lang filter. Consequences:
 
-**Instance cap:** the decoder has 200 o2o queries, and `dense` expressions reach 500–1000 instances. For an expression with more than 200 instances, either drop it, or keep a random 200 and set `is_exhaustive=False` for it. With `weak_loss`, unmatched predictions are then not pushed to background. The proposal is subsample + non-exhaustive (§6, Q3).
+- **Text context is 32 BPE tokens including SOT/EOT** (`VETextEncoder` `context_length=32`, `model/text_encoder_ve.py:265`). Longer prompts are **silently truncated** (`model/tokenizer_ve.py:252`). Level 3–6 expressions and non-English text (the CLIP BPE is English-centric, so Arabic falls back to byte-level tokens) will exceed it. Before training, measure the token-length distribution per level and lang over the blend. If more than about 1 % is truncated, extend the context (e.g. 64): copy the 32 pretrained positions and initialise the rest from the last one. The encoder is causal, so existing positions are unaffected. Otherwise the comparison partly measures truncation, not the architecture.
+- No horizontal flip in augmentations (left/right expressions).
+- `clean_expression` strips a leading article, which is harmless for SAM3.
+
+**Instance cap: drop, never subsample (decided).** The decoder has 200 o2o queries. A query with more than 200 instances is dropped (that query only; the image's other queries stay), and every kept query is `is_exhaustive=True`. Subsampling would be wrong here: the configs use `weak_loss: False`, so `is_exhaustive` is not even read, and the unsampled instances would be trained as background. Per the Falcon toml, dropping above 100 removed only about 1 % of masks, so the loss of data is small. **The AR comparison must drop the same queries**, or report those queries separately.
 
 ## 4. Loader design: a SAM3 energon TaskEncoder
 
@@ -133,9 +137,9 @@ removed and `task: referring_segmentation` (no `tasks: all`).
   2. Resize to 1008×1008. SAM3 was trained with a square resize (`RandomResizeAPI square: true`), so keep that; optionally add scale jitter later.
   3. Keep uint8 CHW.
   4. Parse the task dicts as above.
-  5. Select the positive expressions and draw ≤ `max_neg_per_image` negatives.
-  6. Cap queries at `max_queries_per_image`, shuffling first; leftovers are dropped this epoch.
-  7. Cap instances at 200 (subsample + non-exhaustive).
+  5. Keep every positive expression and every file negative (no per-image cap).
+  6. Shuffle the queries.
+  7. Drop queries with more than 200 instances.
   8. Decode masks with `_decode_masks_resized(rles, (1008, 1008))` into `PackedMask`, and compute tight boxes from the masks.
   9. Raise `SkipSample` if no query is left, and count skips per source.
 - Don't copy the Falcon `try/except → None` pattern: count and log skips instead of swallowing errors.
@@ -146,7 +150,10 @@ removed and `task: referring_segmentation` (no `tasks: all`).
   - a `pin_memory()` method on the batch dataclass
 
   On the GPU, unpack the masks (or point-sample straight from bits) and normalize the image.
-- **Batching:** fixed `B` images per rank, plus a cap on total queries per rank batch (`max_queries_per_batch`). The cap bounds the per-query encoder/decoder memory term, so a few dense images can't OOM a step. Energon has no cross-rank balance, so set the caps for the worst case.
+- **Batching: a query budget, not an image count.** Queries per image are uncapped, so the rank batch is filled to `max_queries_per_batch` (plus a ceiling on images).
+  - An image with more queries than the budget is split into several samples of the same image. SAM3 queries are independent (each sees only the image and its own text, like Falcon's per-query attention), so splitting loses nothing; it only costs another ViT pass for that image.
+  - The budget is set from the Phase 0 sweep: the largest that fits memory at good throughput.
+  - Energon has no cross-rank balance, but a query budget also evens out per-rank step time.
 - **Augmentation:** none to start (v1.5 runs with none, since `aug_prob_threshold` is unset). Add later:
   - SAM3-style random resize (min 480) + pad, on GPU or with nearest masks.
   - Photometric augs.
@@ -193,6 +200,7 @@ removed and `task: referring_segmentation` (no `tasks: all`).
 
 **Phase 3 — Loss, matcher and model efficiency (3–4 days)**
 - Point-sampled mask loss: `num_sample_points=12544`, `oversample_ratio=3.0`, `importance_sample_ratio=0.75`. Targets are sampled from the bit-packed masks without materializing the full float targets. Compare against full-res loss on a short run (mask AP / cgF1 within noise).
+- **Masks only for matched queries.** The seg head computes `pred_masks` for all 400 queries per prompt (200 o2o + 200 o2m, at 288², `model/maskformer_segmentation.py:327-337`): ~66 MB bf16 per prompt, more in fp32 in the loss. The matcher uses only logits and boxes, so in training: run matching before the mask predictor, then compute mask logits only for matched o2o/o2m queries, ideally only at the sampled points. Memory per prompt then scales with #instances, not #queries. This is the main lever for many queries per GPU. Inference is unchanged.
 - One matching call for the final + aux layers (`repeat_batch`) and for o2m. That is one D2H copy per step instead of ~12. Run the scipy calls in a thread pool, or try a GPU batched assignment. Fix L3 and drop the CPU OOM fallback (L4).
 - Selective activation checkpointing:
   - Turn it off for the decoder, boxRPB and seg head first, then the fusion encoder; keep it on the ViT.
@@ -220,11 +228,28 @@ removed and `task: referring_segmentation` (no `tasks: all`).
 
 The numbers come from Phase 0; nothing here has been measured yet.
 
-## 6. Decisions needed
+## 6. Decisions
 
-1. **Expression levels:** train on `[0, 1, 2, dense, none]` only (SAM3's concept-prompt regime), or include the referring levels 3–6?
-2. **Queries per image:** cap and positive:negative ratio. Proposal: ≤16 queries per image, ≤4 negatives (file negatives only, no synthetic negatives from other images to start).
-3. **Dense expressions (>200 instances):** subsample to 200 as non-exhaustive (proposal), or drop them?
-4. **Exhaustivity:** can we assume every `referring_segmentation` key lists *all* its instances? Are there sources where this is known to be false (e.g. `saco_aligned_data`, crawled sets)?
-5. **Starting checkpoint:** SAM3 (Nov 2025) or SAM3.1 image weights; full finetune or frozen text encoder?
-6. **Where the encoder lives:** `sam3` depending on `torchtitan-internal` (proposal, single schema implementation), or vendor the few functions into `sam3`?
+Decided:
+
+1. **Levels:** all levels and languages (architecture stress test vs AR). Text-length truncation must be measured first (§3).
+2. **Queries per image:** as many as memory and throughput allow. A per-batch query budget, set by the Phase 0 sweep; all file negatives kept.
+3. **Instances:** keep the default 200 queries; drop queries with more than 200 instances, never subsample. All data is exhaustive.
+4. **Start:** the released SAM3 image checkpoint, full model (its PE-derived vision and text encoders, fusion encoder, decoder, seg head).
+
+Open:
+
+5. **Frozen or trained text encoder,** given that its training lr is 10× lower in the released recipe. Proposal: train it, since the AR baseline trains its text side.
+6. **Where the encoder lives:** `sam3` depending on `torchtitan-internal` (proposal), or vendored helpers.
+7. **Extending the text context** beyond 32 tokens, depending on the truncation scan.
+
+### Cost of more than 200 object queries (for reference)
+
+Per prompt, the per-query costs are:
+
+- **Decoder:** self-attention O(Q²) is negligible at Q = 400. Cross-attention O(Q·5184) has a boxRPB bias of 8 × Q × 5184 per layer (~33 MB bf16 at Q = 400). FFNs are O(Q).
+- **Mask head:** Q × 288² logits, plus the DAC o2m copy.
+- **Hungarian matching:** on the CPU, growing super-linearly in Q.
+- **New query embeddings:** queries beyond 200 start untrained.
+
+Doubling to 400 roughly doubles decoder and mask-head memory and time per prompt, which directly cuts queries per GPU. With masks computed only for matched queries (Phase 3), the mask-head term no longer scales with Q. Not worth it for ~1 % of masks; revisit only if dense queries become a target.
