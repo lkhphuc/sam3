@@ -147,6 +147,8 @@ def sigmoid_focal_loss(
     Returns:
         Loss tensor
     """
+    # The triton kernels are CUDA-only; CPU tensors take the eager path.
+    triton = triton and inputs.is_cuda
     if not (0 <= alpha <= 1) and triton:
         raise RuntimeError(f"Alpha should be in [0,1], got {alpha}")
     if triton:
@@ -583,10 +585,18 @@ class Masks(LossWithWeights):
         oversample_ratio=None,
         importance_sample_ratio=None,
         apply_loss_to_det_queries_in_video_grounding=True,
+        target_sampling="bilinear",
     ):
         super().__init__(weight_dict, compute_aux)
         if compute_aux:
             warnings.warn("Masks loss usually shouldn't be applied to aux outputs")
+        # With num_sample_points set: "bilinear" (original) grid-samples the
+        # matched target masks after gathering them at full resolution, once per
+        # match (o2m repeats each target topk times); "nearest" reads the target
+        # bit at each sampled point straight from targets["masks"], so no
+        # per-match copy of the full-resolution targets is made.
+        assert target_sampling in ("bilinear", "nearest")
+        self.target_sampling = target_sampling
         self.focal_alpha = focal_alpha
         self.focal_gamma = focal_gamma
         self.num_sample_points = num_sample_points
@@ -640,6 +650,48 @@ class Masks(LossWithWeights):
 
         return losses
 
+    def _sampled_loss_gather_targets(self, src_masks_all, targets, indices, num_boxes):
+        """Point-sampled focal + dice, targets read at the points (nearest).
+
+        src_masks_all: [B, Q, h, w] predicted logits. targets["masks"]: [N, H, W]
+        bool at image resolution. Only the matched predictions are upsampled at
+        the sampled points; the targets are indexed per point.
+        """
+        tgt_idx = indices[2]
+        if tgt_idx is None:
+            tgt_idx = torch.arange(len(indices[0]), device=src_masks_all.device)
+        keep = targets["is_valid_mask"][tgt_idx]
+        src_masks = src_masks_all[(indices[0], indices[1])][keep]
+        tgt_idx = tgt_idx[keep]
+        if src_masks.shape[0] == 0:
+            zero = src_masks_all.sum() * 0.0
+            return {"loss_mask": zero, "loss_dice": zero.clone()}
+        src_masks = src_masks[:, None].float()
+        with torch.no_grad():
+            point_coords = get_uncertain_point_coords_with_randomness(
+                src_masks,
+                calculate_uncertainty,
+                self.num_sample_points,
+                self.oversample_ratio,
+                self.importance_sample_ratio,
+            )  # [M, P, 2] (x, y) in [0, 1]
+            H, W = targets["masks"].shape[-2:]
+            xs = (point_coords[..., 0] * W).long().clamp_(0, W - 1)
+            ys = (point_coords[..., 1] * H).long().clamp_(0, H - 1)
+            sampled_targets = targets["masks"][tgt_idx[:, None], ys, xs].float()
+        sampled_src = point_sample(src_masks, point_coords, align_corners=False)
+        sampled_src = sampled_src.squeeze(1)
+        return {
+            "loss_mask": sigmoid_focal_loss(
+                sampled_src,
+                sampled_targets,
+                num_boxes,
+                alpha=self.focal_alpha,
+                gamma=self.focal_gamma,
+            ),
+            "loss_dice": dice_loss(sampled_src, sampled_targets, num_boxes),
+        }
+
     # pyrefly: ignore [bad-override]
     def get_loss(self, outputs, targets, indices, num_boxes):
         """Compute the losses related to the masks: the focal loss and the dice loss.
@@ -662,6 +714,11 @@ class Masks(LossWithWeights):
                 "loss_mask": torch.tensor(0.0, device=src_masks.device),
                 "loss_dice": torch.tensor(0.0, device=src_masks.device),
             }
+
+        if self.num_sample_points is not None and self.target_sampling == "nearest":
+            return self._sampled_loss_gather_targets(
+                src_masks, targets, indices, num_boxes
+            )
 
         target_masks = (
             targets["masks"] if indices[2] is None else targets["masks"][indices[2]]

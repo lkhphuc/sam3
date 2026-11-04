@@ -605,9 +605,37 @@ class Sam3Image(torch.nn.Module):
         return previous_stages_out
 
     def _compute_matching(self, out, targets):
+        aux_outs = out.get("aux_outputs", [])
+        if getattr(self, "batch_matching_over_layers", False) and aux_outs:
+            # One matcher call (one device->host copy) for the final and all
+            # auxiliary layers; same assignments as one call per layer.
+            self._compute_matching_batched([out] + list(aux_outs), targets)
+            return
         out["indices"] = self.matcher(out, targets)
-        for aux_out in out.get("aux_outputs", []):
+        for aux_out in aux_outs:
             aux_out["indices"] = self.matcher(aux_out, targets)
+
+    def _compute_matching_batched(self, outs, targets):
+        num_layers = len(outs)
+        bs = outs[0]["pred_logits"].shape[0]
+        num_targets = targets["boxes"].shape[0]
+        stacked = {
+            k: torch.cat([o[k] for o in outs], dim=0)
+            for k in ("pred_logits", "pred_boxes")
+        }
+        batch_idx, src_idx, tgt_idx = self.matcher(
+            stacked, targets, repeat_batch=num_layers
+        )
+        layer = torch.div(batch_idx, bs, rounding_mode="floor")
+        # Entries come out layer-major (one block of batch elements per layer),
+        # so each layer's block is contiguous: split by counts, no sort needed.
+        counts = torch.bincount(layer, minlength=num_layers).tolist()
+        b_parts = torch.split(batch_idx, counts)
+        s_parts = torch.split(src_idx, counts)
+        t_parts = torch.split(tgt_idx, counts) if tgt_idx is not None else None
+        for i, o in enumerate(outs):
+            t = None if t_parts is None else t_parts[i] - i * num_targets
+            o["indices"] = (b_parts[i] - i * bs, s_parts[i], t)
 
     def back_convert(self, targets):
         batched_targets = {

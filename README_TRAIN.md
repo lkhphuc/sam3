@@ -1,5 +1,7 @@
 # Training
 
+> Large-scale training from PE encoders on the Falcon Perception v1.5 segmentation data (energon, step-based trainer): see [`docs/FALCON_V15_TRAINING.md`](docs/FALCON_V15_TRAINING.md).
+
 This repository supports finetuning SAM3 models on custom datasets in multi-node setup or local execution. The training script is located at `sam3/train.py` and uses Hydra configuration management to handle complex training setups.
 
 

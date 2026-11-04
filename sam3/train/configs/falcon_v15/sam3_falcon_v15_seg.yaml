@@ -1,0 +1,231 @@
+# @package _global_
+# SAM3 image model trained from PE encoders on the Falcon Perception v1.5
+# segmentation data (referring segmentation + negatives, all levels/languages).
+# Launch: python -m sam3.train.train_streaming -c configs/falcon_v15/sam3_falcon_v15_seg.yaml
+# under torchrun (one process per GPU). See docs/LARGE_SCALE_TRAINING_PLAN.md.
+defaults:
+  - _self_
+
+paths:
+  dataset_path: /mnt/falcon-perception/configs/perception_datasets/sam3_falcon_v15_seg.yaml
+  experiment_log_dir: ???
+  bpe_path: null  # the bundled sam3/assets/bpe_simple_vocab_16e6.txt.gz
+  pe_checkpoint: hf://facebook/PE-Core-L14-336:PE-Core-L14-336.pt
+
+scratch:
+  resolution: 1008
+  max_steps: 200000
+  # Per-GPU step budget (query = one text prompt on one image). Tune with the
+  # Phase 0 sweep; these are starting points for a B200 (178 GiB).
+  max_queries_per_batch: 256
+  max_instances_per_batch: 4000
+  max_images_per_batch: 16
+  max_queries_per_sample: 64
+  # LR recipe of the released SAM3 configs at lr_scale 1.0 (they finetune at
+  # 0.1). Detector heads start from scratch here, so sweep lr_scale first.
+  lr_scale: 1.0
+  lr_transformer: ${times:8e-4,${scratch.lr_scale}}
+  lr_vision_backbone: ${times:2.5e-4,${scratch.lr_scale}}
+  lr_language_backbone: ${times:5e-5,${scratch.lr_scale}}
+  lrd_vision_backbone: 0.9
+  wd: 0.1
+  warmup_steps: 2000
+  cooldown_steps: 20000
+  timescale: 2000
+  matcher:
+    _target_: sam3.train.matcher.BinaryHungarianMatcherV2
+    focal: true
+    cost_class: 2.0
+    cost_bbox: 5.0
+    cost_giou: 2.0
+    alpha: 0.25
+    gamma: 2
+    stable: false
+
+trainer:
+  _target_: sam3.train.streaming_trainer.StreamingTrainer
+  max_steps: ${scratch.max_steps}
+  seed: 123
+  amp_dtype: bfloat16
+  batch_matching_over_layers: true
+  norm_mean: [0.5, 0.5, 0.5]
+  norm_std: [0.5, 0.5, 0.5]
+  # Parameters that never receive a gradient in this setup (measured by
+  # test/test_streaming_trainer.py), frozen so DDP can skip unused-parameter
+  # detection: the pooled text projection (SAM3 uses per-token text features),
+  # the neck's 0.5x level (dropped by the backbone's scalp=1) and the pixel
+  # decoder's last stage. If DDP still reports unused parameters on GPU, add
+  # them here (or set find_unused_parameters: true).
+  frozen_param_patterns:
+    - backbone.language_backbone.encoder.text_projection
+    - backbone.vision_backbone.convs.3.*
+    - segmentation_head.pixel_decoder.conv_layers.2.*
+    - segmentation_head.pixel_decoder.norms.2.*
+  distributed:
+    backend: nccl
+    timeout_mins: 30
+    find_unused_parameters: false
+    gradient_as_bucket_view: true
+    static_graph: false
+    comms_dtype: null
+
+  model:
+    _target_: sam3.train.model_init.build_sam3_image_model_for_training
+    bpe_path: ${paths.bpe_path}
+    vit_depth: 24  # PE-Core-L14-336
+    vit_mlp_ratio: 4.0
+    vit_global_att_blocks: null  # (5, 11, 17, 23)
+    vit_drop_path_rate: 0.1
+    text_context_length: 256
+    text_pad_to_longest: true
+    enable_segmentation: true
+    compile_vision: false
+    use_fa3: false
+    pe_checkpoint: ${paths.pe_checkpoint}
+
+  loss:
+    _target_: sam3.train.loss.sam3_loss.Sam3LossWrapper
+    matcher: ${scratch.matcher}
+    o2m_weight: 2.0
+    o2m_matcher:
+      _target_: sam3.train.matcher.BinaryOneToManyMatcher
+      alpha: 0.3
+      threshold: 0.4
+      topk: 4
+    use_o2m_matcher_on_o2m_aux: false
+    loss_fns_find:
+      - _target_: sam3.train.loss.loss_fns.Boxes
+        weight_dict:
+          loss_bbox: 5.0
+          loss_giou: 2.0
+      - _target_: sam3.train.loss.loss_fns.IABCEMdetr
+        weak_loss: false
+        weight_dict:
+          loss_ce: 20.0
+          presence_loss: 20.0
+        pos_weight: 10.0
+        alpha: 0.25
+        gamma: 2
+        use_presence: true
+        pos_focal: false
+        pad_n_queries: 200
+        pad_scale_pos: 1.0
+      - _target_: sam3.train.loss.loss_fns.Masks
+        focal_alpha: 0.25
+        focal_gamma: 2.0
+        weight_dict:
+          loss_mask: 200.0
+          loss_dice: 10.0
+        compute_aux: false
+        # Point-sampled mask loss (Mask2Former / PointRend); targets read at the
+        # points instead of gathered at full resolution per match.
+        num_sample_points: 12544
+        oversample_ratio: 3.0
+        importance_sample_ratio: 0.75
+        target_sampling: nearest
+    loss_fn_semantic_seg:
+      _target_: sam3.train.loss.loss_fns.SemanticSegCriterion
+      presence_head: true
+      presence_loss: false
+      focal: true
+      focal_alpha: 0.6
+      focal_gamma: 2.0
+      downsample: false
+      weight_dict:
+        loss_semantic_seg: 20.0
+        loss_semantic_presence: 1.0
+        loss_semantic_dice: 30.0
+    scale_by_find_batch_size: true
+
+  data:
+    train:
+      _target_: sam3.train.data.falcon_energon.Sam3EnergonLoader
+      dataset_path: ${paths.dataset_path}
+      num_workers: 10
+      shuffle_buffer_size: 64
+      packing_buffer_size: 128
+      max_samples_per_sequence: 16
+      watchdog_timeout_seconds: 300
+      task_encoder:
+        _target_: sam3.train.data.falcon_energon.Sam3FalconTaskEncoder
+        resolution: ${scratch.resolution}
+        resize_scales: null  # 480..1008 step 32, the SAM3 train recipe
+        random_pad: true
+        max_instances_per_query: 200  # decoder object queries; larger queries are dropped
+        max_negatives_per_image: -1  # all file negatives
+        max_queries_per_sample: ${scratch.max_queries_per_sample}
+        max_queries_per_batch: ${scratch.max_queries_per_batch}
+        max_instances_per_batch: ${scratch.max_instances_per_batch}
+        max_images_per_batch: ${scratch.max_images_per_batch}
+        strip_articles: true  # as the Falcon loader (clean_expression)
+
+  optim:
+    optimizer:
+      _target_: torch.optim.AdamW
+      fused: true
+    gradient_clip:
+      _target_: sam3.train.optim.optimizer.GradientClipper
+      max_norm: 0.1
+      norm_type: 2
+    param_group_modifiers:
+      - _target_: sam3.train.optim.optimizer.layer_decay_param_modifier
+        _partial_: true
+        layer_decay_value: ${scratch.lrd_vision_backbone}
+        apply_to: backbone.vision_backbone.trunk
+        overrides:
+          - pattern: "*pos_embed*"
+            value: 1.0
+    options:
+      lr:
+        - scheduler:
+            _target_: sam3.train.optim.schedulers.InverseSquareRootParamScheduler
+            base_lr: ${scratch.lr_transformer}
+            timescale: ${scratch.timescale}
+            warmup_steps: ${scratch.warmup_steps}
+            cooldown_steps: ${scratch.cooldown_steps}
+        - scheduler:
+            _target_: sam3.train.optim.schedulers.InverseSquareRootParamScheduler
+            base_lr: ${scratch.lr_vision_backbone}
+            timescale: ${scratch.timescale}
+            warmup_steps: ${scratch.warmup_steps}
+            cooldown_steps: ${scratch.cooldown_steps}
+          param_names:
+            - backbone.vision_backbone.*
+        - scheduler:
+            _target_: sam3.train.optim.schedulers.InverseSquareRootParamScheduler
+            base_lr: ${scratch.lr_language_backbone}
+            timescale: ${scratch.timescale}
+            warmup_steps: ${scratch.warmup_steps}
+            cooldown_steps: ${scratch.cooldown_steps}
+          param_names:
+            - backbone.language_backbone.*
+      weight_decay:
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+            value: ${scratch.wd}
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+            value: 0.0
+          param_names:
+            - "*bias*"
+          module_cls_names: ["torch.nn.LayerNorm"]
+
+  checkpoint:
+    save_dir: ${paths.experiment_log_dir}/checkpoints
+    save_every_steps: 2000
+    keep_every_steps: 20000
+    resume_from: null
+
+  logging:
+    log_dir: ${paths.experiment_log_dir}/logs
+    log_freq: 10
+    tensorboard_writer:
+      _target_: sam3.train.utils.logger.make_tensorboard_logger
+      log_dir: ${paths.experiment_log_dir}/tensorboard
+      flush_secs: 120
+      should_log: true
+
+  profiler:
+    enabled: false
+    start_step: 50
+    num_steps: 5

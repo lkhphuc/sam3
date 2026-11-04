@@ -220,6 +220,61 @@ class TextTransformer(nn.Module):
             self.text_projection = nn.Linear(width, output_dim)
         else:
             self.text_projection = nn.Parameter(torch.empty(width, output_dim))
+        self.init_parameters()
+
+    def init_parameters(self):
+        """open_clip TextTransformer init. Released SAM3 / PE weights overwrite it
+        when loaded; it matters for random init (positional_embedding and
+        text_projection were left as torch.empty)."""
+        nn.init.normal_(self.token_embedding.weight, std=0.02)
+        nn.init.normal_(self.positional_embedding, std=0.01)
+        width, layers = self.width, len(self.transformer.resblocks)
+        proj_std = (width**-0.5) * ((2 * layers) ** -0.5)
+        attn_std = width**-0.5
+        fc_std = (2 * width) ** -0.5
+        for block in self.transformer.resblocks:
+            nn.init.normal_(block.attn.in_proj_weight, std=attn_std)
+            nn.init.normal_(block.attn.out_proj.weight, std=proj_std)
+            nn.init.normal_(block.mlp.c_fc.weight, std=fc_std)
+            nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
+        if isinstance(self.text_projection, nn.Linear):
+            nn.init.normal_(self.text_projection.weight, std=width**-0.5)
+            if self.text_projection.bias is not None:
+                nn.init.zeros_(self.text_projection.bias)
+        else:
+            nn.init.normal_(self.text_projection, std=width**-0.5)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        # A checkpoint trained with a shorter context (e.g. PE / SAM3: 32) loads
+        # into a longer one: its positions are kept as they are, and each new
+        # position starts as a copy of the last trained one. The encoder is
+        # causal, so the output on the first `n_ckpt` tokens is unchanged.
+        key = prefix + "positional_embedding"
+        pos = state_dict.get(key)
+        if pos is not None and pos.shape[0] < self.num_pos:
+            n_ckpt = pos.shape[0]
+            extended = pos.new_empty(self.num_pos, pos.shape[1])
+            extended[:n_ckpt] = pos
+            extended[n_ckpt:] = pos[-1]
+            state_dict[key] = extended
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def build_causal_mask(self) -> torch.Tensor:
         # lazily create causal attention mask, with full attention between the tokens
@@ -267,9 +322,14 @@ class VETextEncoder(nn.Module):
         use_ln_post: bool = True,
         compile_mode: Optional[str] = None,
         use_act_checkpoint: bool = True,
+        pad_to_longest: bool = False,
     ):
         super().__init__()
         self.context_length = context_length
+        # Pad each batch to its longest prompt instead of `context_length`.
+        # Outputs on real tokens are unchanged (causal encoder, padding masked
+        # downstream); off by default to keep inference bit-identical.
+        self.pad_to_longest = pad_to_longest
         self.use_ln_post = use_ln_post
         self.tokenizer = tokenizer
 
@@ -299,9 +359,12 @@ class VETextEncoder(nn.Module):
             assert input_boxes is None or len(input_boxes) == 0, "not supported"
 
             # Encode the text
-            tokenized = self.tokenizer(text, context_length=self.context_length).to(
-                device
-            )  # [b, seq_len]
+            tokenized = self.tokenizer(text, context_length=self.context_length)
+            if self.pad_to_longest and tokenized.numel():
+                # On the CPU, before the copy: no device sync.
+                longest = int((tokenized != 0).sum(dim=1).max())
+                tokenized = tokenized[:, : max(longest, 1)]
+            tokenized = tokenized.to(device)  # [b, seq_len]
             text_attention_mask = (tokenized != 0).bool()
 
             # manually embed the tokens

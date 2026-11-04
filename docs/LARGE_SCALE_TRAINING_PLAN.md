@@ -230,18 +230,15 @@ The numbers come from Phase 0; nothing here has been measured yet.
 
 ## 6. Decisions
 
-Decided:
+Decided (implementation and GPU checklist: [`FALCON_V15_TRAINING.md`](FALCON_V15_TRAINING.md)):
 
 1. **Levels:** all levels and languages (architecture stress test vs AR). Text-length truncation must be measured first (§3).
 2. **Queries per image:** as many as memory and throughput allow. A per-batch query budget, set by the Phase 0 sweep; all file negatives kept.
 3. **Instances:** keep the default 200 queries; drop queries with more than 200 instances, never subsample. All data is exhaustive.
-4. **Start:** the released SAM3 image checkpoint, full model (its PE-derived vision and text encoders, fusion encoder, decoder, seg head).
-
-Open:
-
-5. **Frozen or trained text encoder,** given that its training lr is 10× lower in the released recipe. Proposal: train it, since the AR baseline trains its text side.
-6. **Where the encoder lives:** `sam3` depending on `torchtitan-internal` (proposal), or vendored helpers.
-7. **Extending the text context** beyond 32 tokens, depending on the truncation scan.
+4. **Start:** PE vision and text encoders, everything else from scratch, all trained — replicating SAM3's own training on our data (not the SAM3 checkpoint). No public PE checkpoint matches SAM3's 32-block trunk; the default is PE-Core-L14-336 (24 blocks), see `FALCON_V15_TRAINING.md`.
+5. **Text context:** 256 tokens (from 32), positions beyond 32 initialised from the last trained one.
+6. **Text encoder:** trained (lr group of the released recipe).
+7. **Where the loader lives:** in `sam3`, with the schema helpers copied from torchtitan-internal (importing that package pulls in its training stack and loads spaCy in every worker); parity is tested against its source.
 
 ### Cost of more than 200 object queries (for reference)
 
