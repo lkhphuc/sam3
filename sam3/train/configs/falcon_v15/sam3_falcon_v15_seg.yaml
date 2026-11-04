@@ -52,6 +52,10 @@ trainer:
   # the loss, instead of 288x288 masks for all 400 queries of every prompt.
   # Same loss; off until checked on GPU (docs/FALCON_V15_TRAINING.md).
   masks_for_matched_queries_only: false
+  # Parts to run without activation checkpointing (vit, text, seg_head,
+  # geometry); pick from the runbook's step-6 sweep. Fusion encoder and decoder
+  # always checkpoint.
+  act_ckpt_off: []
   norm_mean: [0.5, 0.5, 0.5]
   norm_std: [0.5, 0.5, 0.5]
   # Parameters that never receive a gradient in this setup (measured by

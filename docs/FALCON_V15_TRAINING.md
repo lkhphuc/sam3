@@ -130,6 +130,17 @@ pytest test/test_falcon_schema.py test/test_falcon_energon.py test/test_falcon_e
 
 ## GPU checks still to do
 
+The step-by-step commands, pass criteria and fixes are in [`FALCON_V15_GPU_RUNBOOK.md`](FALCON_V15_GPU_RUNBOOK.md). The tools are:
+
+| script | runs on | covers |
+|---|---|---|
+| `scripts/falcon_v15/scan_blend.py` | CPU | checks 3 and 4: mask presence, prompt lengths, dense queries |
+| `scripts/falcon_v15/inspect_loader.py` | CPU | check 2: real loader, renders, host RAM |
+| `scripts/falcon_v15/check_pe_init.py` | GPU | check 1 |
+| `scripts/falcon_v15/bench_train_step.py` | GPU | checks 5–7: numerics, DDP, sweep |
+
+Summary list:
+
 Run these before a long run, roughly in this order. None of them could run in this environment (no GPU, no Energon fork, no cluster data).
 
 1. **PE features carry over.** Run `scripts/falcon_v15/check_pe_init.py --image <img>` with perception_models installed.

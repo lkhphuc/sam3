@@ -304,3 +304,29 @@ def load_pe_into_sam3(model: torch.nn.Module, pe_checkpoint: str) -> None:
         f"Initialised the SAM3 trunk ({len(trunk_sd)} tensors) and text encoder "
         f"({len(text_sd)} tensors) from {pe_checkpoint}"
     )
+
+
+# Activation-checkpointing switches that can be turned off. The fusion encoder
+# and the decoder assert that checkpointing is on in training
+# (model/encoder.py, model/decoder.py), so they are not switchable here.
+ACT_CKPT_PARTS = ("vit", "text", "seg_head", "geometry")
+
+
+def set_activation_checkpointing(
+    model: torch.nn.Module, off: Sequence[str] = ()
+) -> None:
+    """Turn activation checkpointing off for the named parts, on for the others."""
+    m = model.module if hasattr(model, "module") else model
+    unknown = set(off) - set(ACT_CKPT_PARTS)
+    if unknown:
+        raise ValueError(
+            f"unknown act-ckpt parts {sorted(unknown)}; choose from {ACT_CKPT_PARTS}"
+        )
+    m.backbone.vision_backbone.trunk.use_act_checkpoint = "vit" not in off
+    m.backbone.language_backbone.encoder.transformer.grad_checkpointing = (
+        "text" not in off
+    )
+    m.use_act_checkpoint_seg_head = "seg_head" not in off
+    if m.segmentation_head is not None:
+        m.segmentation_head.act_ckpt = "seg_head" not in off
+    m.geometry_encoder.use_act_ckpt = "geometry" not in off

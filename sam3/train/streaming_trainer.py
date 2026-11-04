@@ -158,6 +158,7 @@ class StreamingTrainer:
         frozen_param_patterns: Optional[List[str]] = None,
         batch_matching_over_layers: bool = True,
         masks_for_matched_queries_only: bool = False,
+        act_ckpt_off: Optional[List[str]] = None,
         norm_mean: List[float] = (0.5, 0.5, 0.5),
         norm_std: List[float] = (0.5, 0.5, 0.5),
         profiler: Optional[Dict[str, Any]] = None,
@@ -186,6 +187,11 @@ class StreamingTrainer:
         self._freeze(frozen_param_patterns or [])
         if batch_matching_over_layers:
             _unwrap(self.model).batch_matching_over_layers = True
+        if act_ckpt_off:
+            from sam3.train.model_init import set_activation_checkpointing
+
+            set_activation_checkpointing(self.model, list(act_ckpt_off))
+            logging.info(f"Activation checkpointing off for {list(act_ckpt_off)}")
         if masks_for_matched_queries_only:
             # The seg head returns DeferredMasks; Masks computes only the
             # matched (o2o and o2m) queries' mask logits.

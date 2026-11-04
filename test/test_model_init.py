@@ -234,3 +234,17 @@ def test_batched_matching_equals_per_layer(small_model):
                 assert b is None
             else:
                 torch.testing.assert_close(a, b)
+
+
+def test_set_activation_checkpointing(small_model):
+    m = small_model
+    model_init.set_activation_checkpointing(m, ["seg_head", "text"])
+    assert m.backbone.vision_backbone.trunk.use_act_checkpoint
+    assert not m.backbone.language_backbone.encoder.transformer.grad_checkpointing
+    assert not m.use_act_checkpoint_seg_head and not m.segmentation_head.act_ckpt
+    assert m.geometry_encoder.use_act_ckpt
+    model_init.set_activation_checkpointing(m, [])
+    assert m.backbone.language_backbone.encoder.transformer.grad_checkpointing
+    assert m.use_act_checkpoint_seg_head and m.segmentation_head.act_ckpt
+    with pytest.raises(ValueError):
+        model_init.set_activation_checkpointing(m, ["decoder"])
