@@ -233,6 +233,9 @@ class StreamingTrainer:
 
     def _setup_distributed(self, allow_tf32: bool):
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        # sam3's loggers read LOCAL_RANK / RANK, also when the process group
+        # was initialised by the caller without torchrun's environment.
+        os.environ.setdefault("LOCAL_RANK", str(self.local_rank))
         if torch.cuda.is_available():
             self.device = torch.device("cuda", self.local_rank)
             torch.cuda.set_device(self.device)
@@ -256,6 +259,7 @@ class StreamingTrainer:
             )
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
+        os.environ.setdefault("RANK", str(self.rank))
 
     def _seed_everything(self, seed: int):
         s = seed + self.rank
