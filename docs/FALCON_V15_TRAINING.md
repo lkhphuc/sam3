@@ -184,7 +184,7 @@ Run these before a long run, roughly in this order. None of them could run in th
 
 ## Not done yet (planned efficiency work)
 
-- **Masks at the sampled points only.** With `masks_for_matched_queries_only` (below), each matched query still gets a full 288² logit map before point sampling. Sampling the pixel embeddings at the points instead would cut that further.
+- ~~Masks at the sampled points only~~ (rejected). Sampling the pixel embeddings at the loss points costs more than it saves: 12,544 points × 256 channels is 3.2M values per match, against 83k for the full 288² logit map. The uncertainty pass also needs 3× more points. The full map per matched query is the cheaper form.
 - **o2m matcher.** It still runs once per layer in the loss.
 - **Selective activation checkpointing and `torch.compile` of the trunk.** Use `compile_vision: true`, and measure.
 - **Tokenization in the loader workers.**
