@@ -1,0 +1,34 @@
+# @package _global_
+# Overlay for the released eval configs: evaluate a StreamingTrainer checkpoint
+# of configs/falcon_v15/sam3_falcon_v15_seg.yaml instead of the released SAM3.
+# Paths come from the environment so no file needs editing:
+#   SAM3_EVAL_CHECKPOINT   .../checkpoints/checkpoint.pt (or checkpoint_<step>.pt)
+#   SAM3_EVAL_OUT          where predictions and metrics go
+#   SAM3_GOLD_GT_DIR, SAM3_METACLIP_IMG_DIR, SAM3_SA1B_IMG_DIR   (SA-Co/Gold only)
+# The trunk / text shape must match the run (defaults = the training config).
+paths:
+  checkpoint_path: ${oc.env:SAM3_EVAL_CHECKPOINT}
+  base_experiment_log_dir: ${oc.env:SAM3_EVAL_OUT}
+  base_annotation_path: ${oc.env:SAM3_GOLD_GT_DIR,/missing/SAM3_GOLD_GT_DIR}
+  metaclip_img_path: ${oc.env:SAM3_METACLIP_IMG_DIR,/missing/SAM3_METACLIP_IMG_DIR}
+  sa1b_img_path: ${oc.env:SAM3_SA1B_IMG_DIR,/missing/SAM3_SA1B_IMG_DIR}
+  bpe_path: null
+
+trainer:
+  model:
+    _target_: sam3.train.model_init.build_sam3_image_model_for_eval
+    checkpoint_path: ${paths.checkpoint_path}
+    vit_depth: 24
+    vit_mlp_ratio: 4.0
+    vit_global_att_blocks: null
+    text_context_length: 256
+    enable_segmentation: true
+    eval_mode: true
+    device: cuda
+
+launcher:
+  num_nodes: 1
+  gpus_per_node: 8
+
+submitit:
+  use_cluster: false

@@ -54,6 +54,75 @@ class MaskPredictor(nn.Module):
         return mask_preds
 
 
+class DeferredMasks:
+    """Instance mask logits not materialised yet: the mask-embedded object
+    queries and the per-prompt pixel embeddings whose product they are.
+
+    A training-only stand-in for `pred_masks` [B, Q, H, W]: the loss needs the
+    logits of the matched (prompt, query) pairs only, a few per target instead
+    of all Q (o2o + o2m) queries of every prompt. `gather` computes exactly
+    those rows, with the same math as MaskPredictor.
+    """
+
+    def __init__(self, mask_queries: torch.Tensor, instance_embeds: torch.Tensor):
+        # mask_queries: [B, Q, C] (MaskPredictor.mask_embed of the last decoder
+        # layer); instance_embeds: [B, C, H, W], or [C, H, W] shared by all B.
+        self.mask_queries = mask_queries
+        self.instance_embeds = instance_embeds
+
+    @property
+    def shape(self):
+        b, q, _ = self.mask_queries.shape
+        return torch.Size((b, q) + tuple(self.instance_embeds.shape[-2:]))
+
+    @property
+    def device(self):
+        return self.mask_queries.device
+
+    @property
+    def dtype(self):
+        return torch.promote_types(self.mask_queries.dtype, self.instance_embeds.dtype)
+
+    def slice_queries(
+        self, start: Optional[int], stop: Optional[int]
+    ) -> "DeferredMasks":
+        return DeferredMasks(self.mask_queries[:, start:stop], self.instance_embeds)
+
+    def gather(self, batch_idx: torch.Tensor, query_idx: torch.Tensor) -> torch.Tensor:
+        """Logits [M, H, W] of pairs (batch_idx[m], query_idx[m]); equal to
+        dense_pred_masks[batch_idx, query_idx]."""
+        q = self.mask_queries[batch_idx, query_idx]  # [M, C]
+        inst = self.instance_embeds
+        if inst.ndim == 3:
+            return torch.einsum("mc,chw->mhw", q, inst)
+        h, w = inst.shape[-2:]
+        if batch_idx.numel() == 0:
+            return q.new_zeros((0, h, w)) + inst.sum() * 0
+        # One matmul per prompt that has matches (grouped by prompt).
+        order = torch.argsort(batch_idx, stable=True)
+        counts = torch.bincount(batch_idx, minlength=inst.shape[0]).tolist()
+        chunks, start = [], 0
+        q_sorted = q[order]
+        for b, c in enumerate(counts):
+            if c:
+                chunks.append(
+                    torch.einsum("mc,chw->mhw", q_sorted[start : start + c], inst[b])
+                )
+                start += c
+        out_sorted = torch.cat(chunks, dim=0)
+        inverse = torch.empty_like(order)
+        inverse[order] = torch.arange(order.numel(), device=order.device)
+        return out_sorted[inverse]
+
+    def materialize(self) -> torch.Tensor:
+        """The dense [B, Q, H, W] logits (for tests / debugging)."""
+        if self.instance_embeds.ndim == 3:
+            return torch.einsum(
+                "bqc,chw->bqhw", self.mask_queries, self.instance_embeds
+            )
+        return torch.einsum("bqc,bchw->bqhw", self.mask_queries, self.instance_embeds)
+
+
 class SegmentationHead(nn.Module):
     def __init__(
         self,
@@ -289,8 +358,11 @@ class UniversalSegmentationHead(SegmentationHead):
         encoder_hidden_states: Optional[torch.Tensor] = None,
         prompt: Optional[torch.Tensor] = None,
         prompt_mask: Optional[torch.Tensor] = None,
+        defer_instance_masks: bool = False,
         **kwargs,
     ) -> Dict[str, Optional[torch.Tensor]]:
+        """defer_instance_masks: return `pred_masks` as DeferredMasks (training
+        only), so that only the matched queries' masks are ever computed."""
         assert encoder_hidden_states is not None
         bs = encoder_hidden_states.shape[1]
 
@@ -326,7 +398,13 @@ class UniversalSegmentationHead(SegmentationHead):
 
         instance_embeds = self.instance_seg_head(pixel_embed)
 
-        if self.no_dec:
+        if defer_instance_masks:
+            if self.no_dec or self.aux_masks:
+                raise ValueError("defer_instance_masks needs one mask per object query")
+            mask_pred = DeferredMasks(
+                self.mask_predictor.mask_embed(obj_queries[-1]), instance_embeds
+            )
+        elif self.no_dec:
             mask_pred = self.mask_predictor(instance_embeds)
         elif self.aux_masks:
             mask_pred = self.mask_predictor(obj_queries, instance_embeds)
